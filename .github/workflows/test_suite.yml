@@ -1,4 +1,4 @@
-name: Run Unit Test, Coverage, Pre-Commit Hooks
+name: Unit Tests
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ on:
 
 jobs:
   build:
-    name: Unit Tests
     runs-on: ubuntu-latest
     strategy:
       matrix:
