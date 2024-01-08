@@ -39,14 +39,14 @@ jobs:
           coverage report -m
         continue-on-error: false
 
-      - uses: tibdex/github-app-token@v1
-        id: generate-token
-        with:
-          app_id: ${{ secrets.codecov_ci }}
-          private_key: ${{ secrets.codecov_ci }}
+      # - uses: tibdex/github-app-token@v1
+      #   id: generate-token
+      #   with:
+      #     app_id: ${{ secrets.codecov_ci }}
+      #     private_key: ${{ secrets.codecov_ci }}
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v3
         env:
-          # CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-          CODECOV_TOKEN: ${{ steps.generate-token.outputs.token }}
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          # CODECOV_TOKEN: ${{ steps.generate-token.outputs.token }}
