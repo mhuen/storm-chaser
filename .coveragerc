@@ -1,0 +1,9 @@
+# .coveragerc
+
+[run]
+branch = True
+source = storm_chaser
+
+[report]
+
+omit = storm_chaser/__about__.py
