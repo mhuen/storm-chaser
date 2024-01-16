@@ -6,10 +6,10 @@ import tqdm
 
 import tensorflow as tf
 
-from tfscripts.model import DenseNN
+from tfscripts.model import DenseNNGaussian
 
 
-class StormChaser(DenseNN):
+class StormChaser(DenseNNGaussian):
     """Analyzer for systematic uncertainties"""
 
     def __init__(
@@ -22,13 +22,23 @@ class StormChaser(DenseNN):
         min_events_per_bin: int = 100,
         data_trafo: dict[str, str] = {},
         param_sys_type: str | dict[str, str] = "uniform",
-        # NN parameters
-        fc_sizes=[64, 64, 1],
+        # NN parameters: main prediction
+        fc_sizes=[32, 32, 1],
         use_dropout_list=False,
-        activation_list="relu",
+        activation_list=["elu", "elu", None],
         use_batch_normalisation_list=False,
-        use_residual_list=True,
+        use_residual_list=False,
+        # NN parameters: uncertainty prediction
+        fc_sizes_unc=[32, 32, 1],
+        use_dropout_list_unc=False,
+        activation_list_unc=["elu", "elu", None],
+        use_batch_normalisation_list_unc=False,
+        use_residual_list_unc=False,
+        use_nth_fc_layer_as_input=None,
+        min_sigma_value=1e-3,
+        # NN parameters: general
         dtype="float32",
+        **kwargs,
     ):
         """Initialize the StormChaser object
 
@@ -75,7 +85,7 @@ class StormChaser(DenseNN):
             to have the same type. If provided as a dictionary, the type of
             each systematic parameter must be specified individually.
 
-        # NN parameters
+        # NN parameters: main prediction
         fc_sizes : list of int
             The number of nodes for each layer. The ith int denotes the number
             of nodes for the ith layer. The number of layers is inferred from
@@ -95,8 +105,44 @@ class StormChaser(DenseNN):
             Denotes whether to use residual additions in the layers.
             If only a single boolean is provided, it will be used for all
             layers.
+
+        # NN parameters: uncertainty prediction
+        fc_sizes_unc : list of int
+            The number of nodes for each uncertainty layer. The ith int
+            denotes the number of nodes for the ith layer. The number of
+            layers is inferred from the length of 'fc_sizes_unc'.
+        use_dropout_list_unc : bool, optional
+            Denotes whether to use dropout in the uncertainty layers.
+            If only a single boolean is provided, it will be used for all
+            layers.
+        activation_list_unc : str or callable, optional
+            The activation function to be used in each uncertainty layer.
+            If only one activation is provided, it will be used for all
+            layers.
+        use_batch_normalisation_list_unc : bool or list of bool, optional
+            Denotes whether to use batch normalisation in the uncertainty
+            layers. If only a single boolean is provided, it will be used for
+            all layers.
+        use_residual_list_unc : bool or list of bool, optional
+            Denotes whether to use residual additions in the uncertainty
+            layers. If only a single boolean is provided, it will be used
+            for all layers.
+        use_nth_fc_layer_as_input : int, optional
+            Denotes which layer to use as input for the uncertainty layers.
+            If None, the same input as for the main prediction network
+            is used as input for the uncertainty sub-network.
+            If negative, the layer is counted from the last layer.
+            For example, use_nth_fc_layer_as_input=-2 denotes the second last
+            layer.
+        min_sigma_value : float
+            The lower bound for the uncertainty estimation.
+            This is used to ensure robustness of the training.
+
+        # NN parameters: general
         dtype : str, optional
             The float precision type.
+        **kwargs : dict
+            Additional arguments to pass to the DenseNNGaussian class.
 
         Raises
         ------
@@ -113,12 +159,23 @@ class StormChaser(DenseNN):
             activation_list=activation_list,
             use_batch_normalisation_list=use_batch_normalisation_list,
             use_residual_list=use_residual_list,
+            fc_sizes_unc=fc_sizes_unc,
+            use_dropout_list_unc=use_dropout_list_unc,
+            activation_list_unc=activation_list_unc,
+            use_batch_normalisation_list_unc=use_batch_normalisation_list_unc,
+            use_residual_list_unc=use_residual_list_unc,
+            use_nth_fc_layer_as_input=use_nth_fc_layer_as_input,
+            min_sigma_value=min_sigma_value,
             dtype=dtype,
+            **kwargs,
         )
 
         self.params = sorted(params)
         self.params_sys = sorted(params_sys)
         self._params_all = sorted(self.params + self.params_sys)
+        self._param_idx = {
+            param: i for i, param in enumerate(self._params_all)
+        }
         self.param_bounds = param_bounds
         self.min_target_per_bin = min_target_per_bin
         self.min_events_per_bin = min_events_per_bin
@@ -197,6 +254,41 @@ class StormChaser(DenseNN):
         config.update(updates)
         return deepcopy(config)
 
+    def call(self, inputs, training=False, keep_prob=None):
+        """Apply model
+
+        Parameters
+        ----------
+        inputs : tf.Tensor or array_like
+            The input data.
+            Shape: [n_batch, n_inputs]
+        training : None, optional
+            Indicates whether currently in training or inference mode.
+            Must be provided if batch normalisation is used.
+            True: in training mode
+            False: inference mode.
+        keep_prob : None, optional
+            The keep probability to be used for dropout.
+            Can either be a float or a scalar float tf.Tensor.
+
+        Returns
+        -------
+        tf.Tensor
+            The predicted sigma.
+        """
+        y_pred, y_pred_unc = super().call(
+            inputs=inputs,
+            training=training,
+            keep_prob=keep_prob,
+        )
+
+        # ratios should be around 1, help NN by
+        # setting mean to 1 and reducing std dev.
+        y_pred = y_pred * 0.1 + 1.0
+
+        # stack and return
+        return tf.stack([y_pred, y_pred_unc], axis=2)
+
     def trafo_param(
         self, values: list[float], param: str, invert: bool = False
     ):
@@ -257,11 +349,13 @@ class StormChaser(DenseNN):
         pd.DataFrame
             The transformed data.
         """
-        inputs = np.empty_like(inputs)
+        inputs = np.array(inputs)
 
         for i, trafo in self._data_trafo_idx:
             inputs[:, i] = self.trafo_param(
-                values=inputs[:, i], param=self._params_all[i], invert=invert
+                values=inputs[:, i],
+                param=self._params_all[i],
+                invert=invert,
             )
         return inputs
 
@@ -370,6 +464,7 @@ class StormChaser(DenseNN):
         ignore_missing_samples: bool = False,
         epochs: int = 100,
         steps_per_epoch: int = 1000,
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         **kwargs,
     ):
         """Build model
@@ -423,13 +518,12 @@ class StormChaser(DenseNN):
             keys = self._params_all + [weight_key]
 
         # only select relevant columns
-        print("keys", keys)
         df_sys = df_sys[keys]
 
         if df_base is None:
             df_base = df_sys
         else:
-            df_base = self.trafo(df_base[keys])
+            df_base = df_base[keys]
 
             # Note: code needs to be added to ensure that
             #       df_base and df_sys have the same distribution
@@ -463,11 +557,21 @@ class StormChaser(DenseNN):
 
         train_generator = input_generator(generator)
 
+        # define loss function
+        class GaussianLikelihood(tf.keras.losses.Loss):
+            def call(self, y_true, y_pred):
+                y_pred_mean = y_pred[..., 0]
+                y_pred_sigma = y_pred[..., 1]
+                return tf.reduce_mean(
+                    tf.math.square(y_pred_mean - y_true) / y_pred_sigma
+                    + tf.math.log(y_pred_sigma),
+                    axis=-1,
+                )
+
         # compile model
         self.compile(
-            optimizer="adam",
-            loss="mse",
-            metrics=["mse"],
+            optimizer=optimizer,
+            loss=GaussianLikelihood(),
         )
 
         # perform training of NN
@@ -496,6 +600,7 @@ class StormChaser(DenseNN):
         params: dict[str, float] = None,
         weight_key: str = None,
         max_n_sys: int = None,
+        bootstrap: bool = False,
         rng: np.random.RandomState = None,
     ):
         """Sample events from data frame for given range of parameters
@@ -517,6 +622,11 @@ class StormChaser(DenseNN):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
+        bootstrap : bool, optional
+            If True, an additional bootstrap sampling is applied when
+            calculating the variation due to systematic uncertainties.
+            The bootstrapping is able to cover some of the statistical
+            uncertainties in the data sample.
         rng : np.random.RandomState, optional
             A random number generator.
 
@@ -531,6 +641,9 @@ class StormChaser(DenseNN):
         float
             The weight scaling factor.
         """
+        if bootstrap:
+            raise NotImplementedError
+
         if max_n_sys is None:
             max_n_sys = len(self.params_sys)
         else:
@@ -578,7 +691,7 @@ class StormChaser(DenseNN):
             raise NotImplementedError
         else:
             n_events = mask.sum()
-            if n_events < self.min_events_per_bin:
+            if n_events < self.min_target_per_bin:
                 raise RuntimeError(
                     "Not enough events in sample to sample parameters!",
                     ranges,
@@ -676,6 +789,7 @@ class StormChaser(DenseNN):
         size: int = None,
         weight_key: str = None,
         max_n_sys: int = None,
+        bootstrap: bool = False,
         rng: np.random.RandomState = None,
         ignore_missing_samples: bool = False,
     ):
@@ -698,6 +812,11 @@ class StormChaser(DenseNN):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
+        bootstrap : bool, optional
+            If True, an additional bootstrap sampling is applied when
+            calculating the variation due to systematic uncertainties.
+            The bootstrapping is able to cover some of the statistical
+            uncertainties in the data sample.
         rng : np.random.RandomState, optional
             A random number generator.
         ignore_missing_samples : bool, optional
@@ -723,16 +842,17 @@ class StormChaser(DenseNN):
             try:
                 df_sys_i, mask_i, ranges_i, weight_scaling_i = self.sample_df(
                     df_sys_r,
-                    rng=rng,
                     weight_key=weight_key,
                     max_n_sys=max_n_sys,
+                    bootstrap=bootstrap,
+                    rng=rng,
                 )
             except RuntimeError:
                 if ignore_missing_samples:
-                    continue
-                    self.logger.warning(
+                    self.logger.info(
                         "Not enough events in sample to sample parameters"
                     )
+                    continue
                 else:
                     raise
 
@@ -751,6 +871,19 @@ class StormChaser(DenseNN):
 
             df_base_i = df_base_r[mask_base]
 
+            # check stats
+            min_num_events = min(len(df_sys_i), len(df_base_i))
+            if min_num_events < self.min_events_per_bin:
+                if ignore_missing_samples:
+                    self.logger.info(
+                        f"Too few events in sample: {min_num_events}"
+                    )
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"Too few events in sample: {min_num_events}"
+                    )
+
             # compute varied fraction wrt baseline
             if weight_key is None:
                 variation = (
@@ -767,8 +900,3 @@ class StormChaser(DenseNN):
             counter += 1
             if size is not None and counter >= size:
                 break
-
-    # def __call__(self):
-    #     if not self._model_is_built:
-    #         raise RuntimeError("Model not built")
-    #     raise NotImplementedError
