@@ -15,7 +15,7 @@ maintainers = [
 ]
 requires-python = ">=3.7"
 
-dependencies = ["numpy", "pyyaml", "tensorflow", "tqdm"]
+dependencies = ["numpy", "pyyaml", "tensorflow", "tqdm", "tfscripts"]
 
 classifiers = [
     "Development Status :: 4 - Beta",

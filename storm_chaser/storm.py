@@ -1,14 +1,15 @@
+from copy import deepcopy
 import numpy as np
 import pandas as pd
 import logging
 import tqdm
 
-# import tensorflow as tf
+import tensorflow as tf
 
-# from tfscripts import layers as tfs
+from tfscripts.model import DenseNN
 
 
-class StormChaser:
+class StormChaser(DenseNN):
     """Analyzer for systematic uncertainties"""
 
     def __init__(
@@ -21,8 +22,15 @@ class StormChaser:
         min_events_per_bin: int = 100,
         data_trafo: dict[str, str] = {},
         param_sys_type: str | dict[str, str] = "uniform",
+        # NN parameters
+        fc_sizes=[64, 64, 1],
+        use_dropout_list=False,
+        activation_list="relu",
+        use_batch_normalisation_list=False,
+        use_residual_list=True,
+        dtype="float32",
     ):
-        """Initialize the StormChaser
+        """Initialize the StormChaser object
 
         Parameters
         ----------
@@ -67,12 +75,47 @@ class StormChaser:
             to have the same type. If provided as a dictionary, the type of
             each systematic parameter must be specified individually.
 
+        # NN parameters
+        fc_sizes : list of int
+            The number of nodes for each layer. The ith int denotes the number
+            of nodes for the ith layer. The number of layers is inferred from
+            the length of 'fc_sizes'.
+        use_dropout_list : bool, optional
+            Denotes whether to use dropout in the layers.
+            If only a single boolean is provided, it will be used for all
+            layers.
+        activation_list : str or callable, optional
+            The type of activation function to be used in each layer.
+            If only one activation is provided, it will be used for all layers.
+        use_batch_normalisation_list : bool or list of bool, optional
+            Denotes whether to use batch normalisation in the layers.
+            If only a single boolean is provided, it will be used for all
+            layers.
+        use_residual_list : bool or list of bool, optional
+            Denotes whether to use residual additions in the layers.
+            If only a single boolean is provided, it will be used for all
+            layers.
+        dtype : str, optional
+            The float precision type.
+
         Raises
         ------
         NotImplementedError
             _description_
         """
         self.logger = logging.getLogger(__name__)
+
+        # Create NN model
+        super().__init__(
+            input_shape=[-1, len(params) + len(params_sys)],
+            fc_sizes=fc_sizes,
+            use_dropout_list=use_dropout_list,
+            activation_list=activation_list,
+            use_batch_normalisation_list=use_batch_normalisation_list,
+            use_residual_list=use_residual_list,
+            dtype=dtype,
+        )
+
         self.params = sorted(params)
         self.params_sys = sorted(params_sys)
         self._params_all = sorted(self.params + self.params_sys)
@@ -100,6 +143,13 @@ class StormChaser:
                 "and params_sys."
             )
 
+        # save trafo types for each parameter
+        self._data_trafo_idx = [
+            (i, self.data_trafo[param])
+            for i, param in enumerate(self._params_all)
+            if param in self.data_trafo
+        ]
+
         # transform parameter bounds
         self._param_bounds_trafo = self.trafo(self.param_bounds)
 
@@ -122,6 +172,30 @@ class StormChaser:
         for param in self.params_sys:
             lower, upper = self.param_bounds[param]
             self._width[param] = upper - lower
+
+    def get_config(self):
+        """Get Configuration of StormChaser
+
+        Returns
+        -------
+        dict
+            A dictionary with all configuration settings. This can be used
+            to serealize and deserealize the model.
+        """
+        config = super().get_config()
+        config.pop("input_shape")
+        updates = {
+            "params": self.params,
+            "params_sys": self.params_sys,
+            "param_bounds": self.param_bounds,
+            "params_trafo_bin_width_range": self.params_trafo_bin_width_range,
+            "min_target_per_bin": self.min_target_per_bin,
+            "min_events_per_bin": self.min_events_per_bin,
+            "data_trafo": self.data_trafo,
+            "param_sys_type": self.param_sys_type,
+        }
+        config.update(updates)
+        return deepcopy(config)
 
     def trafo_param(
         self, values: list[float], param: str, invert: bool = False
@@ -165,6 +239,32 @@ class StormChaser:
             )
         return result
 
+    def trafo_inputs(self, inputs: np.ndarray, invert: bool = False):
+        """Transforms the input array
+
+        Parameters
+        ----------
+        inputs : np.ndarray
+            The data to transform. These inputs must be provided
+            in the non-transformed space and in the same order as the
+            sorted list of observable and systematic parameters in
+            `self._params_all`.
+        invert : bool, optional
+            Whether to invert the transformation, by default False.
+
+        Returns
+        -------
+        pd.DataFrame
+            The transformed data.
+        """
+        inputs = np.empty_like(inputs)
+
+        for i, trafo in self._data_trafo_idx:
+            inputs[:, i] = self.trafo_param(
+                values=inputs[:, i], param=self._params_all[i], invert=invert
+            )
+        return inputs
+
     def trafo(self, df: dict | pd.DataFrame, invert: bool = False):
         """Apply the data transformation to the data
 
@@ -194,12 +294,83 @@ class StormChaser:
             df_out = pd.DataFrame(df_out)
         return df_out
 
-    def build(
+    def df2input(self, df: pd.DataFrame, return_y: bool = False):
+        """Convert data frame to model input
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The data frame to convert.
+        return_y : bool, optional
+            Whether to return the labels, by default False.
+
+        Returns
+        -------
+        np.ndarray
+            The model input: x.
+        np.ndarray [optional]
+            The labels: y.
+        """
+        df_trafo = self.trafo(df)
+        x = df_trafo[self._params_all].values
+        if return_y:
+            y = df_trafo["variation"].values
+            return x, y
+        else:
+            return x
+
+    def chase(self, df):
+        """Predict the impact of systematic uncertainties on the observable
+        parameters
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The data sample to predict on.
+
+        Returns
+        -------
+        np.ndarray
+            The predicted impact of systematic uncertainties on the
+            observable parameters.
+        """
+        if not self._model_is_built:
+            raise RuntimeError("Model not built")
+        return self.concrete_func(self.df2input(df)).numpy()
+
+    def chase_inputs(self, inputs: np.ndarray):
+        """Predict the impact of systematic uncertainties on the observable
+        parameters
+
+        Parameters
+        ----------
+        inputs : np.ndarray
+            The data sample to predict on. These inputs must be provided
+            in the non-transformed space and in the same order as the
+            sorted list of observable and systematic parameters in
+            `self._params_all`.
+
+        Returns
+        -------
+        np.ndarray
+            The predicted impact of systematic uncertainties on the
+            observable parameters.
+        """
+        if not self._model_is_built:
+            raise RuntimeError("Model not built")
+        return self.concrete_func(self.trafo_inputs(inputs)).numpy()
+
+    def build_model(
         self,
         df_sys: pd.DataFrame,
         df_base: pd.DataFrame = None,
         weight_key: str = None,
         seed: int = 42,
+        max_n_sys: int = None,
+        ignore_missing_samples: bool = False,
+        epochs: int = 100,
+        steps_per_epoch: int = 1000,
+        **kwargs,
     ):
         """Build model
 
@@ -221,6 +392,19 @@ class StormChaser:
             the same weight.
         seed : int, optional
             The random seed to use for sampling training samples.
+        max_n_sys : int, optional
+            The maximum number of systematic parameters to vary in a generated
+            sample. If None, up to the total number of systematic parameters
+            are varied.
+        ignore_missing_samples : bool, optional
+            If True, missing samples are ignored, by default False.
+            If False, a RuntimeError is raised if a sample cannot be created.
+        epochs : int, optional
+            The number of epochs to train the model, by default 100.
+        steps_per_epoch : int, optional
+            The number of steps per epoch, by default 1000.
+        kwargs : dict
+            Additional arguments to pass to the model training.
 
         Raises
         ------
@@ -230,16 +414,22 @@ class StormChaser:
             _description_
         """
 
-        # only select relevant columns
-        df_sys = df_sys[self._params_all]
+        # create random number generator
+        rng = np.random.RandomState(seed=seed)
 
-        # apply data transformation
-        df_sys = self.trafo(df_sys)
+        if weight_key is None:
+            keys = self._params_all
+        else:
+            keys = self._params_all + [weight_key]
+
+        # only select relevant columns
+        print("keys", keys)
+        df_sys = df_sys[keys]
 
         if df_base is None:
             df_base = df_sys
         else:
-            df_base = self.trafo(df_base[self._params_all])
+            df_base = self.trafo(df_base[keys])
 
             # Note: code needs to be added to ensure that
             #       df_base and df_sys have the same distribution
@@ -249,13 +439,56 @@ class StormChaser:
                 "Fitting to a different base sample not implemented"
             )
 
-        # # check possible binning sizes
-        # fraction = self.min_events_per_bin / len(df_sys)
-        # bin_widths = {}
+        # create trafo model
+        trafo_data = []
+        for param in self._params_all:
+            trafo_data.append(
+                rng.uniform(*self._param_bounds_trafo[param], size=1000)
+            )
+        self.create_trafo_model(np.stack(trafo_data, axis=1))
 
+        # create data generator
+        generator = self.get_data_generator(
+            df_base=df_base,
+            df_sys=df_sys,
+            weight_key=weight_key,
+            max_n_sys=max_n_sys,
+            rng=rng,
+            ignore_missing_samples=ignore_missing_samples,
+        )
+
+        def input_generator(generator):
+            while True:
+                yield self.df2input(next(generator), return_y=True)
+
+        train_generator = input_generator(generator)
+
+        # compile model
+        self.compile(
+            optimizer="adam",
+            loss="mse",
+            metrics=["mse"],
+        )
+
+        # perform training of NN
+        self.fit(
+            x=train_generator,
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            **kwargs,
+        )
+
+        # create concrete function of trained model
+        input_shape = list(self._input_shape)
+        input_shape[0] = None
+        concrete_func = tf.function(self).get_concrete_function(
+            tf.TensorSpec(input_shape, self.dtype)
+        )
+
+        self.concrete_func = concrete_func
+
+        # done
         self._model_is_built = True
-
-        raise NotImplementedError
 
     def sample_df(
         self,
@@ -298,6 +531,11 @@ class StormChaser:
         float
             The weight scaling factor.
         """
+        if max_n_sys is None:
+            max_n_sys = len(self.params_sys)
+        else:
+            max_n_sys = min(max_n_sys, len(self.params_sys))
+
         if rng is None:
             rng = np.random.RandomState()
 
@@ -331,7 +569,7 @@ class StormChaser:
             mask &= (df[param] >= lower) & (df[param] <= upper)
 
         # sample number of systematic parameters to vary
-        n_sys = rng.randint(1, min(max_n_sys, len(self.params_sys)) + 1)
+        n_sys = rng.randint(1, max_n_sys + 1)
         sys_params = rng.choice(self.params_sys, size=n_sys, replace=False)
 
         # compute how large the range of each systematic parameter can be
@@ -412,6 +650,66 @@ class StormChaser:
             The training stamples f(var_1, ... var_N, sys_1, ..., sys_M) = m
         """
 
+        # create data generator
+        generator = self.get_data_generator(
+            df_base=df_base,
+            df_sys=df_sys,
+            weight_key=weight_key,
+            max_n_sys=max_n_sys,
+            rng=rng,
+            ignore_missing_samples=ignore_missing_samples,
+        )
+
+        # create empty data frame
+        df_list = []
+
+        # collect data
+        for _ in tqdm.trange(size, disable=not verbose):
+            df_list.append(next(generator))
+
+        return pd.concat(df_list, axis=0, ignore_index=True)
+
+    def get_data_generator(
+        self,
+        df_base: pd.DataFrame,
+        df_sys: pd.DataFrame,
+        size: int = None,
+        weight_key: str = None,
+        max_n_sys: int = None,
+        rng: np.random.RandomState = None,
+        ignore_missing_samples: bool = False,
+    ):
+        """Create a training dataset for the model
+
+        Parameters
+        ----------
+        df_base : pd.DataFrame
+            The baseline data sample.
+        df_sys : pd.DataFrame
+            The data sample to sample from for systematic variations.
+        weight_key : str, optional
+            The name of the column containing the weights,
+            by default None. If None, all events are assumed to have
+            the same weight.
+        size : int, optional
+            The number of training samples to create.
+            If None, an infinite generator is returned.
+        max_n_sys : int, optional
+            The maximum number of systematic parameters to vary in a generated
+            sample. If None, up to the total number of systematic parameters
+            are varied.
+        rng : np.random.RandomState, optional
+            A random number generator.
+        ignore_missing_samples : bool, optional
+            If True, missing samples are ignored, by default False.
+            If False, a RuntimeError is raised if a sample cannot be created.
+
+        Returns
+        -------
+        pd.DataFrame
+            The training stamples f(var_1, ... var_N, sys_1, ..., sys_M) = m
+        """
+
         if weight_key is None:
             keys = self._params_all
         else:
@@ -420,11 +718,8 @@ class StormChaser:
         df_sys_r = df_sys[keys].copy()
         df_base_r = df_base[keys].copy()
 
-        # create empty data frame
-        data = {param: [] for param in self._params_all}
-        data["variation"] = []
-
-        for _ in tqdm.trange(size, disable=not verbose):
+        counter = 0
+        while True:
             try:
                 df_sys_i, mask_i, ranges_i, weight_scaling_i = self.sample_df(
                     df_sys_r,
@@ -442,8 +737,9 @@ class StormChaser:
                     raise
 
             # get average parameter values
+            data = {}
             for param in self._params_all:
-                data[param].append(df_sys_i[param].mean())
+                data[param] = df_sys_i[param].mean()
 
             # apply mask to baseline sample
             mask_base = np.ones(len(df_base_r), dtype=bool)
@@ -464,11 +760,15 @@ class StormChaser:
                 variation = (
                     df_sys_i[weight_key].sum() / df_base_i[weight_key].sum()
                 )
-            data["variation"].append(variation)
+            data["variation"] = variation
 
-        return pd.DataFrame(data)
+            yield pd.DataFrame(data, index=[counter])
 
-    def __call__(self):
-        if not self._model_is_built:
-            raise RuntimeError("Model not built")
-        raise NotImplementedError
+            counter += 1
+            if size is not None and counter >= size:
+                break
+
+    # def __call__(self):
+    #     if not self._model_is_built:
+    #         raise RuntimeError("Model not built")
+    #     raise NotImplementedError
