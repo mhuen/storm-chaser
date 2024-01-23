@@ -23,15 +23,15 @@ class StormChaser(DenseNNGaussian):
         data_trafo: dict[str, str] = {},
         param_sys_type: str | dict[str, str] = "uniform",
         # NN parameters: main prediction
-        fc_sizes=[32, 32, 1],
+        fc_sizes=[64, 1],
         use_dropout_list=False,
-        activation_list=["elu", "elu", None],
+        activation_list=["relu", None],
         use_batch_normalisation_list=False,
         use_residual_list=False,
         # NN parameters: uncertainty prediction
-        fc_sizes_unc=[32, 32, 1],
+        fc_sizes_unc=[64, 1],
         use_dropout_list_unc=False,
-        activation_list_unc=["elu", "elu", None],
+        activation_list_unc=["relu", None],
         use_batch_normalisation_list_unc=False,
         use_residual_list_unc=False,
         use_nth_fc_layer_as_input=None,
@@ -282,10 +282,6 @@ class StormChaser(DenseNNGaussian):
             keep_prob=keep_prob,
         )
 
-        # ratios should be around 1, help NN by
-        # setting mean to 1 and reducing std dev.
-        y_pred = y_pred * 0.1 + 1.0
-
         # stack and return
         return tf.stack([y_pred, y_pred_unc], axis=2)
 
@@ -308,6 +304,9 @@ class StormChaser(DenseNNGaussian):
         list[float]
             The transformed values.
         """
+        if param not in self.data_trafo:
+            return values
+
         trafo = self.data_trafo[param]
 
         if trafo == "log+1":
@@ -464,6 +463,8 @@ class StormChaser(DenseNNGaussian):
         ignore_missing_samples: bool = False,
         epochs: int = 100,
         steps_per_epoch: int = 1000,
+        steps_burn_in: int = 0,
+        num_trafo_samples=1000,
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         **kwargs,
     ):
@@ -475,12 +476,13 @@ class StormChaser(DenseNNGaussian):
         Parameters
         ----------
         df_sys : pd.DataFrame
-            The systematic data sample.
+            The systematic data sample in original, non-transformed space.
         df_base : pd.DataFrame, optional
             The base data sample, by default None. If None, the total
             `df_sys` sample is used as the base sample. Note that this
             expects the systemaatic uncertainties to have symmetric
             priors around the nominal value.
+            Data must be in original, non-transformed space.
         weight_key : str, optional
             The name of the column containing the weights,
             by default None. If None, all events are assumed to have
@@ -498,8 +500,16 @@ class StormChaser(DenseNNGaussian):
             The number of epochs to train the model, by default 100.
         steps_per_epoch : int, optional
             The number of steps per epoch, by default 1000.
+        steps_burn_in : int, optional
+            The number of steps to run with MSE loss before switching to
+            Gaussian likelihood, by default 0.
         kwargs : dict
             Additional arguments to pass to the model training.
+
+        Returns
+        -------
+        dict
+            The training history.
 
         Raises
         ------
@@ -534,12 +544,29 @@ class StormChaser(DenseNNGaussian):
             )
 
         # create trafo model
+        self.logger.info("Creating trafo model")
         trafo_data = []
         for param in self._params_all:
             trafo_data.append(
                 rng.uniform(*self._param_bounds_trafo[param], size=1000)
             )
-        self.create_trafo_model(np.stack(trafo_data, axis=1))
+
+        def get_y_true_distribution():
+            df = self.create_training_samples(
+                df_base=df_base,
+                df_sys=df_sys,
+                size=num_trafo_samples,
+                weight_key=weight_key,
+                max_n_sys=max_n_sys,
+                rng=rng,
+                ignore_missing_samples=ignore_missing_samples,
+            )
+            return np.expand_dims(df["variation"].values, axis=-1)
+
+        self.create_trafo_model(
+            inputs=np.stack(trafo_data, axis=1),
+            y_true=get_y_true_distribution(),
+        )
 
         # create data generator
         generator = self.get_data_generator(
@@ -557,25 +584,51 @@ class StormChaser(DenseNNGaussian):
 
         train_generator = input_generator(generator)
 
-        # define loss function
+        # define loss functions
+        class MSE(tf.keras.losses.Loss):
+            def call(self, y_true, y_pred):
+                y_pred_mean = y_pred[..., 0]
+                return tf.reduce_mean(
+                    tf.math.square(y_pred_mean - y_true), axis=-1
+                )
+
         class GaussianLikelihood(tf.keras.losses.Loss):
             def call(self, y_true, y_pred):
                 y_pred_mean = y_pred[..., 0]
                 y_pred_sigma = y_pred[..., 1]
                 return tf.reduce_mean(
-                    tf.math.square(y_pred_mean - y_true) / y_pred_sigma
-                    + tf.math.log(y_pred_sigma),
+                    ((y_pred_mean - y_true) / y_pred_sigma) ** 2
+                    + 2 * tf.math.log(y_pred_sigma),
                     axis=-1,
                 )
 
+        # create placeholder for training history
+        history = {}
+
+        # run some iterations on MSE
+        if steps_burn_in > 0:
+            self.logger.info("Running initial ireations on MSE loss")
+            self.compile(
+                optimizer=optimizer,
+                loss=MSE(),
+            )
+            history["mse"] = self.fit(
+                x=train_generator,
+                epochs=1,
+                steps_per_epoch=steps_burn_in,
+                **kwargs,
+            )
+
+        # run some iterations on Gaussian Likelihood
         # compile model
+        self.logger.info("Running training on Gaussian Likelihood loss")
         self.compile(
             optimizer=optimizer,
             loss=GaussianLikelihood(),
         )
 
         # perform training of NN
-        self.fit(
+        history["gaussian_likelihood"] = self.fit(
             x=train_generator,
             epochs=epochs,
             steps_per_epoch=steps_per_epoch,
@@ -594,6 +647,8 @@ class StormChaser(DenseNNGaussian):
         # done
         self._model_is_built = True
 
+        return history
+
     def sample_df(
         self,
         df: pd.DataFrame,
@@ -609,6 +664,7 @@ class StormChaser(DenseNNGaussian):
         ----------
         df : pd.DataFrame
             The data sample to sample from.
+            Data must be in original, non-transformed space.
         params : dict[str, float]
             If provided, these will be used as parameter values to sample
             around. These values must be in the non-transformed space.
@@ -633,7 +689,7 @@ class StormChaser(DenseNNGaussian):
         Returns
         -------
         pd.DataFrame
-            The sampled data.
+            The sampled data in original, non-transformed space.
         np.ndarray
             A mask indicating which events were selected.
         dict[str, tuple[float, float]]
@@ -798,9 +854,10 @@ class StormChaser(DenseNNGaussian):
         Parameters
         ----------
         df_base : pd.DataFrame
-            The baseline data sample.
+            The baseline data sample in original, non-transformed space.
         df_sys : pd.DataFrame
             The data sample to sample from for systematic variations.
+            Data must be in original, non-transformed space.
         weight_key : str, optional
             The name of the column containing the weights,
             by default None. If None, all events are assumed to have
@@ -856,10 +913,10 @@ class StormChaser(DenseNNGaussian):
                 else:
                     raise
 
-            # get average parameter values
+            # get median parameter values
             data = {}
             for param in self._params_all:
-                data[param] = df_sys_i[param].mean()
+                data[param] = df_sys_i[param].median()
 
             # apply mask to baseline sample
             mask_base = np.ones(len(df_base_r), dtype=bool)
