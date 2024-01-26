@@ -460,6 +460,7 @@ class StormChaser(DenseNNGaussian):
         weight_key: str = None,
         seed: int = 42,
         max_n_sys: int = None,
+        bootstrap_mc: bool = False,
         ignore_missing_samples: bool = False,
         epochs: int = 100,
         steps_per_epoch: int = 1000,
@@ -493,6 +494,13 @@ class StormChaser(DenseNNGaussian):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
+        bootstrap_mc : bool, optional
+            If True, an additional bootstrap sampling is applied when
+            calculating the variation due to systematic uncertainties.
+            This sampling is applied for the unweighted events in order to
+            assess the limited simulation statistics.
+            The bootstrapping is able to cover some of the statistical
+            uncertainties in the data sample.
         ignore_missing_samples : bool, optional
             If True, missing samples are ignored, by default False.
             If False, a RuntimeError is raised if a sample cannot be created.
@@ -558,6 +566,7 @@ class StormChaser(DenseNNGaussian):
                 size=num_trafo_samples,
                 weight_key=weight_key,
                 max_n_sys=max_n_sys,
+                bootstrap_mc=bootstrap_mc,
                 rng=rng,
                 ignore_missing_samples=ignore_missing_samples,
             )
@@ -574,6 +583,7 @@ class StormChaser(DenseNNGaussian):
             df_sys=df_sys,
             weight_key=weight_key,
             max_n_sys=max_n_sys,
+            bootstrap_mc=bootstrap_mc,
             rng=rng,
             ignore_missing_samples=ignore_missing_samples,
         )
@@ -655,7 +665,7 @@ class StormChaser(DenseNNGaussian):
         params: dict[str, float] = None,
         weight_key: str = None,
         max_n_sys: int = None,
-        bootstrap: bool = False,
+        bootstrap_mc: bool = False,
         rng: np.random.RandomState = None,
     ):
         """Sample events from data frame for given range of parameters
@@ -678,9 +688,11 @@ class StormChaser(DenseNNGaussian):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
-        bootstrap : bool, optional
+        bootstrap_mc : bool, optional
             If True, an additional bootstrap sampling is applied when
-            calculating the variation due to systematic uncertainties.
+            sampling events from the simulation dataset. This sampling
+            is applied for the unweighted events in order to assess
+            the limited simulation statistics.
             The bootstrapping is able to cover some of the statistical
             uncertainties in the data sample.
         rng : np.random.RandomState, optional
@@ -690,16 +702,11 @@ class StormChaser(DenseNNGaussian):
         -------
         pd.DataFrame
             The sampled data in original, non-transformed space.
-        np.ndarray
-            A mask indicating which events were selected.
         dict[str, tuple[float, float]]
             The ranges for each parameter.
         float
             The weight scaling factor.
         """
-        if bootstrap:
-            raise NotImplementedError
-
         if max_n_sys is None:
             max_n_sys = len(self.params_sys)
         else:
@@ -785,7 +792,11 @@ class StormChaser(DenseNNGaussian):
         if weight_key is not None:
             df_out[weight_key] *= weight_scaling
 
-        return df_out, mask, ranges, weight_scaling
+        # apply bootstrap sampling
+        if bootstrap_mc:
+            df_out = df_out.sample(len(df_out), replace=True)
+
+        return df_out, ranges, weight_scaling
 
     def create_training_samples(
         self,
@@ -794,6 +805,7 @@ class StormChaser(DenseNNGaussian):
         size: int,
         weight_key: str = None,
         max_n_sys: int = None,
+        bootstrap_mc: bool = False,
         rng: np.random.RandomState = None,
         ignore_missing_samples: bool = False,
         verbose: bool = True,
@@ -816,6 +828,13 @@ class StormChaser(DenseNNGaussian):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
+        bootstrap_mc : bool, optional
+            If True, an additional bootstrap sampling is applied when
+            calculating the variation due to systematic uncertainties.
+            This sampling is applied for the unweighted events in order to
+            assess the limited simulation statistics.
+            The bootstrapping is able to cover some of the statistical
+            uncertainties in the data sample.
         rng : np.random.RandomState, optional
             A random number generator.
         ignore_missing_samples : bool, optional
@@ -836,6 +855,7 @@ class StormChaser(DenseNNGaussian):
             df_sys=df_sys,
             weight_key=weight_key,
             max_n_sys=max_n_sys,
+            bootstrap_mc=bootstrap_mc,
             rng=rng,
             ignore_missing_samples=ignore_missing_samples,
         )
@@ -856,7 +876,7 @@ class StormChaser(DenseNNGaussian):
         size: int = None,
         weight_key: str = None,
         max_n_sys: int = None,
-        bootstrap: bool = False,
+        bootstrap_mc: bool = False,
         rng: np.random.RandomState = None,
         ignore_missing_samples: bool = False,
     ):
@@ -880,9 +900,11 @@ class StormChaser(DenseNNGaussian):
             The maximum number of systematic parameters to vary in a generated
             sample. If None, up to the total number of systematic parameters
             are varied.
-        bootstrap : bool, optional
+        bootstrap_mc : bool, optional
             If True, an additional bootstrap sampling is applied when
             calculating the variation due to systematic uncertainties.
+            This sampling is applied for the unweighted events in order to
+            assess the limited simulation statistics.
             The bootstrapping is able to cover some of the statistical
             uncertainties in the data sample.
         rng : np.random.RandomState, optional
@@ -908,11 +930,11 @@ class StormChaser(DenseNNGaussian):
         counter = 0
         while True:
             try:
-                df_sys_i, mask_i, ranges_i, weight_scaling_i = self.sample_df(
+                df_sys_i, ranges_i, weight_scaling_i = self.sample_df(
                     df_sys_r,
                     weight_key=weight_key,
                     max_n_sys=max_n_sys,
-                    bootstrap=bootstrap,
+                    bootstrap_mc=bootstrap_mc,
                     rng=rng,
                 )
             except RuntimeError:
