@@ -735,7 +735,9 @@ class StormChaser(DenseNNGaussian):
         # apply observables ranges
         mask = np.ones(len(df), dtype=bool)
         for param, (lower, upper) in ranges.items():
-            mask &= (df[param] >= lower) & (df[param] <= upper)
+            # note: faster via numpy than pandas
+            values = df[param].values
+            mask &= (values >= lower) & (values <= upper)
 
         # sample number of systematic parameters to vary
         n_sys = rng.randint(1, max_n_sys + 1)
@@ -767,7 +769,16 @@ class StormChaser(DenseNNGaussian):
             ranges[param] = (lower, upper)
 
             # apply observables ranges
-            mask &= (df[param] >= lower) & (df[param] <= upper)
+            # note: faster via numpy than pandas
+            values = df[param].values
+            mask &= (values >= lower) & (values <= upper)
+
+        if mask.sum() < self.min_events_per_bin:
+            raise RuntimeError(
+                "Not enough events in sample to sample parameters!",
+                mask.sum(),
+                ranges,
+            )
 
         # adjust weights
         df_out = df[mask].copy(deep=True)
@@ -916,15 +927,16 @@ class StormChaser(DenseNNGaussian):
             # get median parameter values
             data = {}
             for param in self._params_all:
-                data[param] = df_sys_i[param].median()
+                # note: faster via numpy median on array rather than pandas
+                data[param] = np.median(df_sys_i[param].values)
 
             # apply mask to baseline sample
             mask_base = np.ones(len(df_base_r), dtype=bool)
             for param in self.params:
                 lower, upper = ranges_i[param]
-                mask_base &= (df_base_r[param] >= lower) & (
-                    df_base_r[param] <= upper
-                )
+                # note: faster via numpy than pandas
+                values = df_base_r[param].values
+                mask_base &= (values >= lower) & (values <= upper)
 
             df_base_i = df_base_r[mask_base]
 
