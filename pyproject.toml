@@ -40,8 +40,8 @@ Documentation = "https://github.com/icecube/storm-chaser"
 "Bug Tracker" = "https://github.com/icecube/storm-chaser/issues"
 Discussions = "https://github.com/icecube/storm-chaser/discussions"
 
-[tool.setuptools]
-packages = ["storm_chaser"]
+[tool.setuptools.packages]
+find = {}  # Scanning implicit namespaces is active by default, turn off via: namespaces = false
 
 [tool.setuptools.dynamic]
 version = {attr = "storm_chaser.__version__"}
